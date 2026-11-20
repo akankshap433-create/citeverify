@@ -98,3 +98,22 @@ class DocumentHistoryItem(BaseModel):
     error_message: Optional[str] = None
     created_at: Optional[str] = None
     total_claims: int = 0
+
+
+class SuggestCitationsRequest(BaseModel):
+    claim_text: str = Field(..., min_length=10, max_length=2000)
+
+
+class SuggestedCitation(BaseModel):
+    title: str
+    authors: List[str] = []
+    year: Optional[int] = None
+    doi: Optional[str] = None
+    url: Optional[str] = None
+    why: str
+    apa: str
+
+
+class SuggestCitationsResponse(BaseModel):
+    query: str
+    suggestions: List[SuggestedCitation]

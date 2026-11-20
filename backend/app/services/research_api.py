@@ -1,5 +1,8 @@
+import difflib
 import logging
 import re
+import unicodedata
+import xml.etree.ElementTree as ET
 from typing import Optional, Dict, Any, List
 import httpx
 
@@ -44,183 +47,290 @@ def clean_xml_tags(text: str) -> str:
     return cleaned
 
 
-async def search_openalex(query: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
-    """
-    Queries the OpenAlex API for works matching the search query.
-    Returns parsed work dictionary or None.
-    """
+# ---------------------------------------------------------------------------
+# Query building: title + first author + year (instead of the raw bibliography)
+# ---------------------------------------------------------------------------
+
+def _norm(text: str) -> str:
+    text = unicodedata.normalize("NFKD", text or "").encode("ascii", "ignore").decode()
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]+", " ", text.lower())).strip()
+
+
+def _strip_marker(ref: str) -> str:
+    return re.sub(r"^\s*(\[\d+\]|\(\d+\)|\d+[.)])\s*", "", ref or "").strip()
+
+
+def parse_year(*texts: str) -> Optional[int]:
+    for t in texts:
+        m = re.search(r"\b(19[5-9]\d|20[0-4]\d)\b", t or "")
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def parse_first_author(in_text: str, reference: str) -> Optional[str]:
+    """First author's surname from '(Vaswani et al., 2017)' or the bibliography entry."""
+    m = re.match(r"\W*([A-Z][A-Za-z'\u2019\-]{2,})(?:\s+et al\.?|\s+and\s|\s*&|\s*,)", in_text or "")
+    if m:
+        return m.group(1)
+    ref = _strip_marker(reference)
+    if not ref:
+        return None
+    chunk = re.split(r",|;|\band\b|&", ref)[0].strip()
+    tokens = [t for t in chunk.split() if t]
+    if not tokens or len(tokens) > 4:
+        return None
+    is_initial = lambda t: len(t.strip(".")) <= 2
+    words = [t.strip(".") for t in tokens if not is_initial(t)]
+    if not words:
+        return None
+    # "A. Vaswani" -> last word; "Vaswani, A." -> first chunk is the surname
+    return words[-1] if is_initial(tokens[0]) else words[0]
+
+
+def clean_title(query: str, reference: str = "") -> str:
+    title = (query or "").strip().strip('"\u201c\u201d')
+    if not title and reference:
+        # best effort: the longest sentence-like segment of the reference
+        parts = [p.strip() for p in re.split(r"\.\s+|\(\d{4}\)", _strip_marker(reference)) if len(p.strip()) > 12]
+        title = max(parts, key=len) if parts else ""
+    return re.sub(r"\s+", " ", title)
+
+
+def _score(title_q: str, author_q: Optional[str], year_q: Optional[int], cand: Dict[str, Any]) -> float:
+    a, b = _norm(title_q), _norm(cand.get("title") or "")
+    if not a or not b:
+        return 0.0
+    sim = difflib.SequenceMatcher(None, a, b).ratio()
+    if len(a) > 12 and (a in b or b in a):
+        sim = max(sim, 0.92)
+    author = 0.0
+    if author_q and cand.get("authors"):
+        aq = _norm(author_q)
+        surnames = [_norm(n).split(" ")[-1] if _norm(n) else "" for n in cand["authors"]]
+        if surnames and surnames[0] == aq:
+            author = 1.0
+        elif aq in surnames:
+            author = 0.5
+    year = 0.0
+    if year_q and cand.get("year"):
+        diff = abs(int(cand["year"]) - year_q)
+        year = 1.0 if diff == 0 else 0.6 if diff == 1 else 0.0
+    return 0.7 * sim + 0.2 * author + 0.1 * year + (0.03 if cand.get("abstract") else 0.0)
+
+
+def pick_best(title_q, author_q, year_q, candidates, min_score: float = 0.72):
+    """Highest-scoring candidate; ties broken by citation count. None if nothing matches the title."""
+    scored = []
+    for c in candidates:
+        if _norm(title_q) and difflib.SequenceMatcher(None, _norm(title_q), _norm(c.get("title") or "")).ratio() < 0.6 \
+                and _norm(title_q) not in _norm(c.get("title") or ""):
+            continue
+        scored.append((_score(title_q, author_q, year_q, c), c.get("cited_by", 0) or 0, c))
+    if not scored:
+        return None
+    scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    best = scored[0]
+    if best[0] < min_score:
+        return None
+    result = {k: v for k, v in best[2].items() if k != "cited_by"}
+    return result
+
+
+def _headers() -> Dict[str, str]:
+    return {"User-Agent": f"CiteVerify/1.0 (mailto:{settings.OPENALEX_EMAIL or 'citeverify@example.com'})"}
+
+
+async def search_openalex(title: str, author: Optional[str], year: Optional[int], client: httpx.AsyncClient):
+    """Title-restricted OpenAlex lookup, then local re-ranking by title/author/year."""
+    safe_title = _norm(title)
+    if not safe_title:
+        return None
     params = {
-        "search": query,
-        "per-page": 3,
+        "filter": f"title.search:{safe_title}",
+        "per-page": 25,
+        "select": "id,doi,title,display_name,publication_year,authorships,abstract_inverted_index,cited_by_count",
     }
     if settings.OPENALEX_EMAIL:
         params["mailto"] = settings.OPENALEX_EMAIL
-
-    headers = {
-        "User-Agent": f"CiteVerify/1.0 (mailto:{settings.OPENALEX_EMAIL or 'citeverify@example.com'})"
-    }
-
     try:
-        response = await client.get(
-            "https://api.openalex.org/works",
-            params=params,
-            headers=headers,
-        )
-        if response.status_code != 200:
-            logger.warning(f"OpenAlex returned status code {response.status_code} for query: {query}")
+        r = await client.get("https://api.openalex.org/works", params=params, headers=_headers())
+        if r.status_code != 200:
+            logger.warning(f"OpenAlex status {r.status_code} for title: {title}")
             return None
-
-        data = response.json()
-        results = data.get("results", [])
-        if not results:
-            return None
-
-        # Look for the best result, preferring ones that have an abstract
-        best_candidate = None
-        for work in results:
-            abstract = reconstruct_abstract(work.get("abstract_inverted_index"))
-            title = work.get("title") or work.get("display_name") or ""
-            
-            # Extract authors
-            authors = []
-            for authorship in work.get("authorships", []):
-                author_name = authorship.get("author", {}).get("display_name")
-                if author_name:
-                    authors.append(author_name)
-
-            year = work.get("publication_year")
-            doi = work.get("doi")
-            url = doi or work.get("id")
-
-            candidate = {
-                "title": title,
-                "authors": authors,
-                "year": year,
+        cands = []
+        for w in r.json().get("results", []):
+            doi = w.get("doi")
+            cands.append({
+                "title": w.get("title") or w.get("display_name") or "",
+                "authors": [a.get("author", {}).get("display_name") for a in w.get("authorships", []) if a.get("author", {}).get("display_name")],
+                "year": w.get("publication_year"),
                 "doi": doi,
-                "url": url,
-                "abstract": abstract,
-            }
-
-            if abstract:
-                return candidate
-            if best_candidate is None:
-                best_candidate = candidate
-
-        return best_candidate
-
+                "url": doi or w.get("id"),
+                "abstract": reconstruct_abstract(w.get("abstract_inverted_index")),
+                "cited_by": w.get("cited_by_count", 0),
+            })
+        return pick_best(title, author, year, cands)
     except Exception as e:
-        logger.warning(f"OpenAlex request failed for query '{query}': {e}")
+        logger.warning(f"OpenAlex request failed for '{title}': {e}")
         return None
 
 
-async def search_crossref(query: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
-    """
-    Fallback query to Crossref API for bibliographic works.
-    Returns parsed work dictionary or None.
-    """
+async def search_crossref(title: str, author: Optional[str], year: Optional[int], client: httpx.AsyncClient):
+    """Crossref fallback using query.title + query.author, then local re-ranking."""
     params = {
-        "query.bibliographic": query,
-        "rows": 3,
+        "query.title": title,
+        "rows": 15,
+        "select": "DOI,title,author,issued,published-print,published-online,created,abstract,URL,is-referenced-by-count",
     }
-    headers = {
-        "User-Agent": f"CiteVerify/1.0 (mailto:{settings.OPENALEX_EMAIL or 'citeverify@example.com'})"
-    }
-
+    if author:
+        params["query.author"] = author
     try:
-        response = await client.get(
-            "https://api.crossref.org/works",
-            params=params,
-            headers=headers,
-        )
-        if response.status_code != 200:
-            logger.warning(f"Crossref returned status code {response.status_code} for query: {query}")
+        r = await client.get("https://api.crossref.org/works", params=params, headers=_headers())
+        if r.status_code != 200:
+            logger.warning(f"Crossref status {r.status_code} for title: {title}")
             return None
-
-        data = response.json()
-        items = data.get("message", {}).get("items", [])
-        if not items:
-            return None
-
-        best_candidate = None
-        for item in items:
+        cands = []
+        for item in r.json().get("message", {}).get("items", []):
             raw_title = item.get("title", [])
-            title = raw_title[0] if raw_title else ""
-
-            # Extract authors
             authors = []
             for a in item.get("author", []):
-                given = a.get("given", "")
-                family = a.get("family", "")
-                full_name = f"{given} {family}".strip()
-                if not full_name and a.get("name"):
-                    full_name = a.get("name")
-                if full_name:
-                    authors.append(full_name)
-
-            # Extract year
-            year = None
-            for date_field in ("published-print", "published-online", "issued", "created"):
-                date_data = item.get(date_field)
-                if date_data and "date-parts" in date_data and date_data["date-parts"]:
-                    parts = date_data["date-parts"][0]
-                    if parts and parts[0]:
-                        try:
-                            year = int(parts[0])
-                            break
-                        except (ValueError, TypeError):
-                            pass
-
+                name = f"{a.get('given', '')} {a.get('family', '')}".strip() or a.get("name", "")
+                if name:
+                    authors.append(name)
+            y = None
+            for f in ("published-print", "published-online", "issued", "created"):
+                parts = (item.get(f) or {}).get("date-parts") or [[]]
+                if parts[0] and parts[0][0]:
+                    y = int(parts[0][0])
+                    break
             doi = item.get("DOI")
-            url = item.get("URL") or (f"https://doi.org/{doi}" if doi else None)
-            abstract = clean_xml_tags(item.get("abstract", ""))
-
-            candidate = {
-                "title": title,
+            cands.append({
+                "title": raw_title[0] if raw_title else "",
                 "authors": authors,
-                "year": year,
+                "year": y,
                 "doi": doi,
-                "url": url,
-                "abstract": abstract,
-            }
-
-            if abstract:
-                return candidate
-            if best_candidate is None:
-                best_candidate = candidate
-
-        return best_candidate
-
+                "url": item.get("URL") or (f"https://doi.org/{doi}" if doi else None),
+                "abstract": clean_xml_tags(item.get("abstract", "")),
+                "cited_by": item.get("is-referenced-by-count", 0),
+            })
+        return pick_best(title, author, year, cands)
     except Exception as e:
-        logger.warning(f"Crossref request failed for query '{query}': {e}")
+        logger.warning(f"Crossref request failed for '{title}': {e}")
         return None
 
 
-async def search_source(query: str) -> Optional[Dict[str, Any]]:
-    """
-    Searches for academic source metadata and abstract.
-    Tries OpenAlex first; if not found or missing abstract, attempts Crossref as fallback.
-    Uses async httpx with a 10-second timeout.
-    """
-    if not query or not query.strip():
+async def search_semantic_scholar(title: str, author: Optional[str], year: Optional[int], client: httpx.AsyncClient, doi: Optional[str] = None):
+    """Abstract fallback #1: Semantic Scholar Graph API (DOI lookup first, then title search)."""
+    fields = "title,abstract,year,authors,externalIds,url,citationCount"
+
+    def to_cand(p: Dict[str, Any]) -> Dict[str, Any]:
+        ext = p.get("externalIds") or {}
+        d = ext.get("DOI")
+        return {
+            "title": p.get("title") or "",
+            "authors": [a.get("name") for a in p.get("authors", []) if a.get("name")],
+            "year": p.get("year"),
+            "doi": f"https://doi.org/{d}" if d else None,
+            "url": (f"https://doi.org/{d}" if d else None) or p.get("url"),
+            "abstract": re.sub(r"\s+", " ", p.get("abstract") or "").strip(),
+            "cited_by": p.get("citationCount", 0),
+        }
+
+    try:
+        if doi:
+            bare = re.sub(r"^https?://(dx\.)?doi\.org/", "", doi)
+            r = await client.get(f"https://api.semanticscholar.org/graph/v1/paper/DOI:{bare}", params={"fields": fields}, headers=_headers())
+            if r.status_code == 200:
+                cand = to_cand(r.json())
+                if cand["abstract"] and _score(title, author, year, cand) >= 0.72:
+                    cand.pop("cited_by", None)
+                    return cand
+        r = await client.get(
+            "https://api.semanticscholar.org/graph/v1/paper/search",
+            params={"query": _norm(title), "limit": 10, "fields": fields},
+            headers=_headers(),
+        )
+        if r.status_code != 200:
+            logger.warning(f"Semantic Scholar status {r.status_code} for title: {title}")
+            return None
+        return pick_best(title, author, year, [to_cand(p) for p in r.json().get("data", [])])
+    except Exception as e:
+        logger.warning(f"Semantic Scholar request failed for '{title}': {e}")
         return None
 
-    clean_query = query.strip()
-    timeout = httpx.Timeout(10.0, connect=5.0)
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        # 1. Primary: OpenAlex
-        openalex_result = await search_openalex(clean_query, client)
-        if openalex_result and openalex_result.get("abstract"):
-            return openalex_result
+async def search_arxiv(title: str, author: Optional[str], year: Optional[int], client: httpx.AsyncClient):
+    """Abstract fallback #2: arXiv API (Atom XML). Covers BERT, ResNet and most ML landmarks."""
+    safe = _norm(title)
+    if not safe:
+        return None
+    query = f'ti:"{safe}"' + (f" AND au:{_norm(author)}" if author else "")
+    ns = {"a": "http://www.w3.org/2005/Atom", "x": "http://arxiv.org/schemas/atom"}
+    try:
+        for q in (query, f'ti:"{safe}"'):
+            r = await client.get("https://export.arxiv.org/api/query", params={"search_query": q, "max_results": 8}, headers=_headers())
+            if r.status_code != 200:
+                logger.warning(f"arXiv status {r.status_code} for title: {title}")
+                return None
+            cands = []
+            for e in ET.fromstring(r.text).findall("a:entry", ns):
+                ttl = re.sub(r"\s+", " ", (e.findtext("a:title", "", ns) or "")).strip()
+                abs_ = re.sub(r"\s+", " ", (e.findtext("a:summary", "", ns) or "")).strip()
+                pub = e.findtext("a:published", "", ns) or ""
+                doi = e.findtext("x:doi", None, ns)
+                cands.append({
+                    "title": ttl,
+                    "authors": [n.findtext("a:name", "", ns) for n in e.findall("a:author", ns)],
+                    "year": int(pub[:4]) if pub[:4].isdigit() else None,
+                    "doi": f"https://doi.org/{doi}" if doi else None,
+                    "url": e.findtext("a:id", None, ns),
+                    "abstract": abs_,
+                    "cited_by": 0,
+                })
+            best = pick_best(title, author, year, cands)
+            if best:
+                return best
+        return None
+    except Exception as e:
+        logger.warning(f"arXiv request failed for '{title}': {e}")
+        return None
 
-        # 2. Fallback: Crossref
-        crossref_result = await search_crossref(clean_query, client)
-        if crossref_result and crossref_result.get("abstract"):
-            return crossref_result
 
-        # If OpenAlex returned metadata (even if abstract is missing), use it if Crossref also has no abstract
-        if openalex_result:
-            return openalex_result
+async def search_source(query: str, reference_string: str = "", in_text_citation: str = "") -> Optional[Dict[str, Any]]:
+    """
+    Finds the cited paper by title + first author + year.
+    Order: OpenAlex -> Crossref -> (only if no abstract yet) Semantic Scholar -> arXiv.
+    A candidate is only returned if its title actually matches, so a wrong paper's abstract
+    is never handed to the verifier.
+    """
+    title = clean_title(query, reference_string)
+    if not title:
+        return None
+    author = parse_first_author(in_text_citation, reference_string)
+    year = parse_year(reference_string, in_text_citation)
+    logger.info(f"Source lookup -> title='{title}' author={author} year={year}")
 
-        # Otherwise return Crossref metadata or None
-        return crossref_result
+    async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as client:
+        oa = await search_openalex(title, author, year, client)
+        if oa and oa.get("abstract"):
+            return oa
+        cr = await search_crossref(title, author, year, client)
+        if cr and cr.get("abstract"):
+            return cr
+
+        # No abstract from OpenAlex/Crossref: try fallbacks and keep the best metadata we already have.
+        meta = oa or cr
+        logger.info("No abstract from OpenAlex/Crossref; trying Semantic Scholar and arXiv")
+        for finder in (
+            lambda: search_semantic_scholar(title, author, year, client, doi=(meta or {}).get("doi")),
+            lambda: search_arxiv(title, author, year, client),
+        ):
+            fb = await finder()
+            if fb and fb.get("abstract"):
+                if meta:  # keep the published-version DOI/URL when we have one
+                    fb["doi"] = meta.get("doi") or fb.get("doi")
+                    fb["url"] = meta.get("url") or fb.get("url")
+                logger.info(f"Abstract recovered via fallback for '{title}'")
+                return fb
+        return meta

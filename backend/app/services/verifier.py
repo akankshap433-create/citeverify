@@ -19,7 +19,13 @@ Available Verdicts (VerdictLiteral):
 - "Partially Supported": The retrieved abstract provides partial support, but the claim oversimplifies, exaggerates, or includes assertions not confirmed by the abstract.
 - "Unsupported": The abstract discusses related topics, but does not provide evidence supporting the specific claim.
 - "Contradictory": The abstract directly contradicts, disproves, or opposes the claim.
-- "Potentially Outdated": The claim was supported by the cited paper, but the cited paper was published prior to 2015 (year < 2015) in a rapidly evolving field (such as Artificial Intelligence, Machine Learning, Genomics, Virology, Quantum Computing, or Cybersecurity) where older findings have been largely superseded or fundamentally revised.
+- "Potentially Outdated": ONLY for claims that make a CURRENT or state-of-the-art assertion (e.g. "X is the best / state-of-the-art / currently the leading approach / still the standard") and rely on an old source (published before 2015) in a fast-moving field where that assertion has likely been superseded. The claim must be about the present state of the field, not about what the paper did.
+
+HISTORICAL vs. CURRENT CLAIMS (critical):
+- A claim that accurately describes what a paper proposed, introduced, trained, demonstrated, or found is a HISTORICAL claim. Judge it only on whether the abstract supports it. Publication age is irrelevant to the verdict.
+  Examples that must be "Supported" when the abstract matches: "Vaswani et al. (2017) proposed the Transformer", "Krizhevsky et al. (2012) trained a deep CNN (AlexNet) on ImageNet", "Devlin et al. (2019) introduced BERT".
+- Foundational and landmark papers must NEVER be marked "Potentially Outdated" for a historical claim just because they are older.
+- Do not use "Potentially Outdated" unless the claim itself asserts something about the present ("currently", "state-of-the-art", "best", "still", "remains", "outperforms all") and the source is too old to back that up. When unsure, choose "Supported", "Partially Supported" or "Unsupported" based on the abstract alone.
 - "Unable to Verify": The retrieved abstract lacks sufficient scientific detail or context to evaluate the claim.
 
 STRICT GROUNDING REQUIREMENT:
@@ -30,6 +36,13 @@ STRICT GROUNDING REQUIREMENT:
 CONFIDENCE:
 - A float between 0.0 and 1.0 reflecting your confidence in the verdict.
 """
+
+
+CURRENT_CLAIM_RE = re.compile(
+    r"state[- ]of[- ]the[- ]art|\bsota\b|\bcurrent(ly)?\b|\bstill\b|\bremains?\b|\bbest\b|\bleading\b|"
+    r"\bmost (accurate|effective|powerful|widely)\b|outperforms? (all|every|existing)|\bto date\b|\bnowadays\b|\btoday\b",
+    re.IGNORECASE,
+)
 
 
 def get_genai_client() -> genai.Client:
@@ -119,7 +132,7 @@ Year: {year}
 {abstract}
 \"\"\"
 
-Analyze whether the abstract supports, partially supports, contradicts, fails to support, or is potentially outdated (pre-2015 fast-moving field, currently 2026).
+Analyze whether the abstract supports, partially supports, contradicts, or fails to support the claim. First decide if the claim is HISTORICAL (describes what the cited paper proposed or found) or CURRENT (asserts today's state of the art). Use \"Potentially Outdated\" only for CURRENT claims backed by a pre-2015 source; historical claims that the abstract supports are \"Supported\" regardless of the paper's age.
 Extract a verbatim quote for evidence_passage, or return an empty string if none exists.
 """
 
@@ -127,7 +140,7 @@ Extract a verbatim quote for evidence_passage, or return an empty string if none
 
     try:
         response = await client.aio.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-3.5-flash-lite",
             contents=prompt,
             config=types.GenerateContentConfig(
                 system_instruction=VERIFIER_SYSTEM_INSTRUCTION,
@@ -159,8 +172,14 @@ Extract a verbatim quote for evidence_passage, or return an empty string if none
         # Enforce strict grounding for evidence_passage
         clean_evidence = enforce_verbatim_grounding(judgment.evidence_passage, abstract)
         
+        verdict = judgment.verdict
+        if verdict == "Potentially Outdated" and clean_evidence and not CURRENT_CLAIM_RE.search(claim.claim_text or ""):
+            # Historical claim with a verbatim supporting passage: age alone must not downgrade it.
+            logger.info("Downgrading 'Potentially Outdated' to 'Supported' for a historical claim.")
+            verdict = "Supported"
+
         return VerificationJudgment(
-            verdict=judgment.verdict,
+            verdict=verdict,
             confidence=round(float(judgment.confidence), 2),
             explanation=judgment.explanation,
             evidence_passage=clean_evidence,

@@ -12,12 +12,15 @@ from app.schemas import (
     ClaimSummary,
     ClaimResult,
     DocumentHistoryItem,
+    SuggestCitationsRequest,
+    SuggestCitationsResponse,
 )
 from app.services.pdf_parser import extract_text_from_pdf
 from app.services.claim_extractor import extract_claims
 from app.services.research_api import search_source
 from app.services.verifier import verify_claim
-from app.services.report_gen import generate_markdown_report
+from app.services.suggester import suggest_citations
+from app.services.report_gen import generate_markdown_report, generate_pdf_report
 from app.services.db import (
     insert_document,
     update_document_status,
@@ -115,8 +118,11 @@ async def run_verification_pipeline(document_id: str) -> None:
         await update_document_status(document_id, "retrieving_sources")
         sources = []
         for claim in claims:
-            query = claim.search_query or claim.in_text_citation
-            source_data = await search_source(query)
+            source_data = await search_source(
+                claim.search_query,
+                reference_string=claim.reference_string,
+                in_text_citation=claim.in_text_citation,
+            )
             sources.append(source_data)
 
         # Phase 3: Verifying claims
@@ -267,24 +273,40 @@ async def get_history():
     return history_items
 
 
+@app.post("/api/suggest-citations", response_model=SuggestCitationsResponse)
+async def suggest_citations_endpoint(req: SuggestCitationsRequest):
+    """Finds 2-3 real papers that could replace a weak citation, with a one-line reason and an APA reference."""
+    try:
+        return await suggest_citations(req.claim_text)
+    except Exception as e:
+        logger.exception(f"Suggest citations failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Could not find replacement sources: {str(e)}")
+
+
 @app.get("/api/report/{document_id}")
-async def download_report(document_id: str):
+async def download_report(document_id: str, format: str = "pdf"):
     """
-    Generates and returns a clean, downloadable Markdown verification report.
+    Returns the verification report as a formatted PDF (default).
+    Pass ?format=md to get the Markdown version instead.
     """
     try:
-        report_md = await generate_markdown_report(document_id)
         doc = await get_document(document_id)
-        filename = doc.get("filename", "document") if doc else "document"
-        clean_name = filename.rsplit(".", 1)[0]
-        download_filename = f"citeverify_report_{clean_name}_{document_id[:8]}.md"
+        if not doc:
+            raise ValueError(f"Document with ID {document_id} not found.")
+        clean_name = (doc.get("filename") or "document").rsplit(".", 1)[0]
+        base_name = f"citeverify_report_{clean_name}_{document_id[:8]}"
+
+        if format.lower() == "md":
+            content = (await generate_markdown_report(document_id)).encode("utf-8")
+            media_type, ext = "text/markdown", "md"
+        else:
+            content = await generate_pdf_report(document_id)
+            media_type, ext = "application/pdf", "pdf"
 
         return Response(
-            content=report_md,
-            media_type="text/markdown",
-            headers={
-                "Content-Disposition": f'attachment; filename="{download_filename}"'
-            },
+            content=content,
+            media_type=media_type,
+            headers={"Content-Disposition": f'attachment; filename="{base_name}.{ext}"'},
         )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))

@@ -1,0 +1,38 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  @apply bg-white font-sans text-ink antialiased;
+  background-image:
+    radial-gradient(55rem 30rem at 92% -6%, rgba(29, 78, 216, 0.08), transparent 60%),
+    radial-gradient(40rem 26rem at -8% 60%, rgba(220, 38, 38, 0.05), transparent 60%);
+  background-attachment: fixed;
+}
+:focus-visible { outline: 2px solid #1D4ED8; outline-offset: 2px; }
+
+@layer components {
+  .card { @apply rounded-xl border border-slate-200 bg-white; box-shadow: 0 1px 2px rgba(15, 23, 42, 0.05), 0 8px 24px -16px rgba(29, 78, 216, 0.25); }
+  .btn { @apply inline-flex items-center justify-center gap-2 rounded-lg bg-maritime px-5 py-2.5 text-sm font-semibold text-white transition hover:bg-maritime-dk disabled:opacity-60; }
+  .btn-red { @apply inline-flex items-center justify-center gap-2 rounded-lg bg-terra px-5 py-2.5 text-sm font-semibold text-white transition hover:bg-terra-dk; }
+  .btn-ghost { @apply inline-flex items-center justify-center gap-2 rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-maritime transition hover:bg-slate-50; }
+}
+
+/* ---- CiteGuide owl animations (all subtle) ---- */
+.owl-body { transform-origin: 60px 112px; animation: owl-breathe 4.5s ease-in-out infinite; }
+.owl-eye { transform-box: fill-box; transform-origin: center; animation: owl-blink 5.5s infinite; }
+.owl-head { transform-origin: 60px 62px; }
+.owl-glow { opacity: 0; }
+.owl-badge { opacity: 0; transform-origin: 98px 24px; }
+.owl-analyzing .owl-head { transform: rotate(5deg) translateY(2px); }
+.owl-analyzing .owl-pupils { animation: owl-scan 2.6s ease-in-out infinite; }
+.owl-analyzing .owl-glow { animation: owl-glow 1.8s ease-in-out infinite; }
+.owl-done .owl-head { animation: owl-nod 1.1s ease-in-out 1; }
+.owl-done .owl-badge { opacity: 1; animation: owl-pop 0.5s ease-out 0.5s both; }
+@keyframes owl-breathe { 0%, 100% { transform: scale(1, 1); } 50% { transform: scale(1.012, 1.022); } }
+@keyframes owl-blink { 0%, 92%, 100% { transform: scaleY(1); } 95% { transform: scaleY(0.08); } }
+@keyframes owl-scan { 0%, 100% { transform: translate(-3px, 3px); } 50% { transform: translate(3px, 3px); } }
+@keyframes owl-glow { 0%, 100% { opacity: 0.05; } 50% { opacity: 0.55; } }
+@keyframes owl-nod { 0%, 100% { transform: rotate(0deg); } 35% { transform: rotate(8deg) translateY(2px); } 65% { transform: rotate(-2deg); } }
+@keyframes owl-pop { from { opacity: 0; transform: scale(0.6); } to { opacity: 1; transform: scale(1); } }
+@media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
